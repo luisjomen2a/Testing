@@ -9,6 +9,10 @@
 #   BUILD_DIR   build directory                 (default: $SIGHT_DIR-build)
 #   SIGHT_REF   Sight git commit/branch/tag     (default: the commit the application was written against)
 #   BUILD_TYPE  CMake build type                (default: Release)
+#   INSTALL_DIR CMake install prefix, must be empty (default: $SIGHT_DIR-install)
+#   PYTHON      Python used by CMake            (default: /usr/bin/python3, the one the system VTK was built with)
+#
+# Extra arguments are passed to the CMake configure step, e.g. ./build_with_sight.sh -DBLA_VENDOR=OpenBLAS
 #
 # Sight's dependencies (Qt6, VTK, ITK, OGRE, OpenCV, DCMTK, Boost, ...) must be installed first, see
 # https://sight.pages.ircad.fr/sight-doc/Installation/index.html
@@ -19,6 +23,8 @@ SIGHT_DIR="${SIGHT_DIR:-${REPO_DIR}/sight}"
 BUILD_DIR="${BUILD_DIR:-${SIGHT_DIR}-build}"
 SIGHT_REF="${SIGHT_REF:-3a22f2038dba50bbafed6826b9c1ad0257e12a49}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+INSTALL_DIR="${INSTALL_DIR:-${SIGHT_DIR}-install}"
+PYTHON="${PYTHON:-/usr/bin/python3}"
 
 if [[ ! -d "${SIGHT_DIR}/.git" ]]; then
     git clone https://github.com/IRCAD/sight.git "${SIGHT_DIR}"
@@ -41,7 +47,10 @@ fi
 cmake -S "${SIGHT_DIR}" -B "${BUILD_DIR}" "${GENERATOR[@]}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DSIGHT_BUILD_TESTS=OFF \
-    -DSIGHT_BUILD_EXAMPLES=OFF
+    -DSIGHT_BUILD_EXAMPLES=OFF \
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
+    -DPython3_EXECUTABLE="${PYTHON}" \
+    "$@"
 
 cmake --build "${BUILD_DIR}" --target ct_ar --parallel
 

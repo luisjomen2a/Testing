@@ -54,6 +54,16 @@ applications are built inside Sight's CMake project.
 
 3. Run `<build dir>/bin/ct_ar`.
 
+Troubleshooting on Ubuntu 24.04:
+
+- `Could NOT find Python3 (missing: Development.Module)`: Ubuntu's VTK package is built with Python wrapping, so its
+  CMake config needs the Python headers of the *system* Python. Run `sudo apt install python3-dev`. The script passes
+  `-DPython3_EXECUTABLE=/usr/bin/python3` so that a pyenv/conda/uv Python on your `PATH` is not picked instead.
+- `nvplConfig.cmake` warnings: harmless. They come from CMake's `FindBLAS`, called by Ceres/SuiteSparse, probing for
+  NVIDIA's NVPL BLAS. Pass e.g. `-DBLA_VENDOR=OpenBLAS` to the script to skip the probe.
+- `CMAKE_INSTALL_PREFIX (/usr/local) isn't empty`: Sight wants an empty install folder. The script uses
+  `sight-install/` next to the Sight checkout.
+
 On Windows, follow the same steps with the Sight Visual Studio/vcpkg setup and run `bin\ct_ar.bat`.
 
 ## Use
