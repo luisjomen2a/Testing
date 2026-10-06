@@ -1,19 +1,20 @@
 <!--
-    CT AR: superimposes a CT scan (DICOM folder or VTK/ITK file) onto an ArUco tag seen by a webcam.
+    CT AR: superimposes a CT scan (DICOM folder or VTK/ITK file) onto the user's face or onto an ArUco tag, seen through
+    a calibrated webcam.
 
-    Built on top of Sight's "tuto17_simple_ar" tutorial (ArUco tracking + calibrated AR camera), where the cube has been
-    replaced by the loaded medical data:
-      - volume rendering and/or 3D slices (negato) of the CT image,
-      - meshes (VTK polydata, OBJ, STL, ...) if any were loaded,
-    all attached to a transform node computed by "ct_ar::ct_placement" so that the data is centered on the tag.
+    Pipeline (one "updater" sequence, run for each video frame on the "tracking" worker):
 
-    Workflow:
-      1. A default (approximate) webcam calibration is loaded at startup. For accurate overlay, calibrate your camera
-         with Sight's "sight_calibrator" or "tools/calibrate_camera.py" and load it with "Load calibration".
-      2. Select your webcam (or a video file) with the camera selector, then press "Start".
-      3. Load a CT scan with "Load DICOM folder" or "Load VTK/ITK file".
-      4. Show the tag (DICT_ARUCO_ORIGINAL, id 101, 60 mm wide - see "data/aruco_101_60mm.pdf") to the camera.
-      5. Tune scale/position/rotation and the transfer function in the side panel ("Settings" button).
+        frame grabber -> synchronizer -> source_frame
+          -> aruco_tracker -> pose_from2d -> reprojection_error  ...........  marker_to_camera  (tag mode)
+          -> ct_ar::face_tracker  ..........................................  face_to_camera    (face mode)
+          -> switch_matrices (tracking mode) -> anchor_to_camera -> inverse -> damping -> AR camera -> render
+
+    The medical data hangs below a transform node computed by ct_ar::ct_placement:
+      - tag mode: the data stands on the tag,
+      - face mode: the CT nose tip is placed on the user's nose tip, with the patient axes along the head axes.
+
+    The UI follows Sight Viewer: a collapsible parameter panel with pages (camera & tracking, data, rendering,
+    placement) and an AR scene with overlay toolbars and tracking status indicators.
 -->
 <plugin id="ct_ar" library="true">
     <requirement id="sight::module::ui" />
@@ -28,9 +29,24 @@
         <object key="data.series">sight::data::series_set</object>
         <object key="data.offset">sight::data::matrix4</object>
         <object key="data.transform">sight::data::matrix4</object>
+        <object key="config.mode">sight::data::integer</object>
         <object key="config.scale">sight::data::real</object>
         <object key="config.sit_on_tag">sight::data::boolean</object>
-        <desc>Computes the transform placing a CT scan on top of an ArUco tag.</desc>
+        <object key="config.skin_threshold">sight::data::real</object>
+        <desc>Computes the transform placing a CT scan on the tracked tag or face.</desc>
+    </extension>
+
+    <extension implements="sight::service::extension::factory">
+        <type>sight::service::filter</type>
+        <service>ct_ar::face_tracker</service>
+        <object key="data.camera">sight::data::camera</object>
+        <object key="data.frame">sight::data::image</object>
+        <object key="data.pose">sight::data::matrix4</object>
+        <object key="data.debug_frame">sight::data::image</object>
+        <object key="config.mode">sight::data::integer</object>
+        <object key="config.show_landmarks">sight::data::boolean</object>
+        <object key="config.presence_threshold">sight::data::real</object>
+        <desc>Detects the face in the video and estimates its 6-DoF pose.</desc>
     </extension>
 
     <!-- Reader configurations: append=false so that loading a new CT replaces the previous one -->
@@ -67,7 +83,7 @@
         <config>
             <!-- ******************************* Objects declaration ****************************** -->
 
-            <!-- ======== Camera / tracking (from tuto17_simple_ar) ======== -->
+            <!-- ======== Camera / video ======== -->
 
             <!-- Series of camera calibration -->
             <object uid="camera_set" type="sight::data::camera_set" />
@@ -77,42 +93,95 @@
             <object uid="frame_tl" type="sight::data::frame_tl" />
             <!-- Video frame that is used for the current iteration -->
             <object uid="source_frame" type="sight::data::image" />
-            <!-- Video frame displayed with debugging overlays -->
+            <!-- Overlays: ArUco detections and face landmarks -->
             <object uid="debug_frame" type="sight::data::image" />
-            <!-- Map containing all detected markers in the current frame -->
-            <object uid="marker_map" type="sight::data::marker_map" />
-            <!-- Marker matrix in the camera world -->
-            <object uid="marker_to_camera" type="sight::data::matrix4" />
-            <!-- Camera matrix in the marker world -->
-            <object uid="camera_to_marker" type="sight::data::matrix4" />
-            <!-- Camera matrix in the marker world, smoothed over time -->
-            <object uid="camera_to_marker_damped" type="sight::data::matrix4" />
+            <object uid="face_debug_frame" type="sight::data::image" />
             <object uid="undistort_map" type="sight::data::image" />
             <object uid="distort_map" type="sight::data::image" />
+
+            <!-- ======== Tracking ======== -->
+
+            <!-- Map containing all detected markers in the current frame -->
+            <object uid="marker_map" type="sight::data::marker_map" />
+            <!-- Tag pose in the camera frame. Initialized 2 m in front of the camera, facing it, so that a CT loaded
+                 before the first detection is previewed small in the middle of the view instead of around the camera -->
+            <object uid="marker_to_camera" type="sight::data::matrix4">
+                <matrix>
+                    <![CDATA[
+                        1  0  0    0
+                        0 -1  0    0
+                        0  0 -1 2000
+                        0  0  0    1
+                    ]]>
+                </matrix>
+            </object>
+            <!-- Face pose in the camera frame (origin at the nose tip), same initialization -->
+            <object uid="face_to_camera" type="sight::data::matrix4">
+                <matrix>
+                    <![CDATA[
+                        1  0  0    0
+                        0 -1  0    0
+                        0  0 -1 2000
+                        0  0  0    1
+                    ]]>
+                </matrix>
+            </object>
+            <!-- Pose of the active anchor (tag or face), selected by the tracking mode -->
+            <object uid="anchor_to_camera" type="sight::data::matrix4" />
+            <!-- Camera pose in the anchor frame, raw and smoothed (inverse of the initial anchor pose, which is the same
+                 matrix: a 180 degrees rotation around x and a translation along its axis) -->
+            <object uid="camera_to_anchor" type="sight::data::matrix4">
+                <matrix>
+                    <![CDATA[
+                        1  0  0    0
+                        0 -1  0    0
+                        0  0 -1 2000
+                        0  0  0    1
+                    ]]>
+                </matrix>
+            </object>
+            <object uid="camera_to_anchor_damped" type="sight::data::matrix4">
+                <matrix>
+                    <![CDATA[
+                        1  0  0    0
+                        0 -1  0    0
+                        0  0 -1 2000
+                        0  0  0    1
+                    ]]>
+                </matrix>
+            </object>
+
+            <object uid="tracking_params" type="sight::data::map">
+                <!-- 0 = ArUco tag, 1 = face -->
+                <item key="mode" type="sight::data::integer" value="1" />
+                <item key="show_landmarks" type="sight::data::boolean" value="true" />
+                <item key="presence" type="sight::data::real" value="0.5" />
+            </object>
 
             <!-- ======== Medical data ======== -->
 
             <!-- Everything loaded from disk (DICOM / VTK / ITK) -->
             <object uid="series_set" type="sight::data::series_set" />
-            <!-- First image and first model of the series set, extracted for the editors and the mesh adaptor -->
+            <!-- Active image and model of the series set, extracted for the editors and the mesh adaptor -->
             <object uid="image" type="sight::data::image_series" deferred="true" />
             <object uid="model_series" type="sight::data::model_series" deferred="true" />
             <!-- Transfer function used for both the volume rendering and the slices -->
             <object uid="ct_tf" type="sight::data::transfer_function" />
-            <!-- User-defined rigid offset of the CT around the tag (edited with the transform editor) -->
+            <!-- User-defined rigid offset of the CT around the anchor (transform editor) -->
             <object uid="ct_offset" type="sight::data::matrix4" />
-            <!-- CT-to-tag transform, computed by ct_placement_srv -->
-            <object uid="ct_to_marker" type="sight::data::matrix4" />
+            <!-- CT-to-anchor transform, computed by ct_placement_srv -->
+            <object uid="ct_to_anchor" type="sight::data::matrix4" />
 
             <!-- CT placement parameters -->
             <object uid="ct_params" type="sight::data::map">
                 <item key="scale" type="sight::data::real" value="1.0" />
                 <item key="sit_on_tag" type="sight::data::boolean" value="true" />
+                <item key="skin_threshold" type="sight::data::real" value="-300" />
             </object>
 
             <!-- Volume rendering parameters -->
             <object uid="volume_params" type="sight::data::map">
-                <item key="sampling" type="sight::data::integer" value="512" />
+                <item key="sampling" type="sight::data::integer" value="768" />
                 <item key="opacity_correction" type="sight::data::integer" value="200" />
                 <item key="pre_integration" type="sight::data::boolean" value="false" />
                 <item key="ambient_occlusion" type="sight::data::boolean" value="false" />
@@ -149,7 +218,7 @@
             <!-- Damping parameters -->
             <object uid="damping_params" type="sight::data::map">
                 <item key="enabled" type="sight::data::boolean" value="true" />
-                <item key="weight" type="sight::data::real" value="0.6" />
+                <item key="weight" type="sight::data::real" value="0.5" />
             </object>
 
             <!-- Reprojection parameters -->
@@ -158,45 +227,184 @@
                 <item key="color" type="sight::data::color" value="#ddbb22" />
             </object>
 
-            <!-- ******************************* UI declaration *********************************** -->
+            <!-- ******************************* Main layout *********************************** -->
 
             <service uid="main_frame" type="sight::module::ui::frame">
                 <gui>
                     <frame>
-                        <name>CT AR - CT scan on ArUco tag</name>
-                        <min_size width="1280" height="720" />
+                        <name>CT AR</name>
+                        <icon>sight::module::ui::icons/human.svg</icon>
+                        <min_size width="1280" height="760" />
+                        <style QSSClass="Background" />
                     </frame>
-                    <toolbar />
                 </gui>
                 <registry>
-                    <toolbar sid="toolbar_view" />
-                    <view sid="camera_view" />
+                    <view sid="main_container_view" />
                 </registry>
             </service>
 
-            <service uid="toolbar_view" type="sight::module::ui::toolbar">
+            <service uid="main_container_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="vertical" />
+                        <view proportion="1" topBorder="5" bottomBorder="5" QSSClass="view_background" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="container_view" />
+                </registry>
+            </service>
+
+            <!-- Parameter panel + scene, and the button re-opening the panel when it is collapsed -->
+            <service uid="container_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::overlay">
+                        <view />
+                        <view x="+1" y="0" visible="false" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="scene_parameter_view" />
+                    <view sid="left_toolbar_slider_view" />
+                </registry>
+            </service>
+
+            <service uid="scene_parameter_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="horizontal" />
+                        <view proportion="0" min_width="440" />
+                        <view proportion="1" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="parameter_view" />
+                    <view sid="scene_overlay_view" />
+                </registry>
+            </service>
+
+            <service uid="left_toolbar_slider_view" type="sight::module::ui::view">
+                <gui>
+                    <toolbar QSSClass="view_background" />
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="vertical" />
+                    </layout>
+                </gui>
+                <registry>
+                    <toolbar sid="left_toolbar_view" />
+                </registry>
+            </service>
+
+            <service uid="left_toolbar_view" type="sight::module::ui::toolbar">
                 <gui>
                     <layout>
-                        <menu_item name="Load calibration" icon="sight::module::ui::icons/calibration.svg" />
+                        <spacer />
+                        <menu_item name="Show parameters" icon="sight::module::ui::icons/right.svg" />
+                    </layout>
+                </gui>
+                <registry>
+                    <menu_item sid="show_parameter_act" />
+                </registry>
+            </service>
+
+            <!-- ******************************* Parameter panel *********************************** -->
+
+            <service uid="parameter_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="vertical" />
+                        <view proportion="0" />
+                        <view proportion="1" />
+                        <view proportion="1" />
+                        <view proportion="1" />
+                        <view proportion="1" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="parameter_toolbar_container" />
+                    <view sid="tracking_page_view" />
+                    <view sid="data_page_view" />
+                    <view sid="rendering_page_view" />
+                    <view sid="placement_page_view" />
+                </registry>
+            </service>
+
+            <service uid="parameter_toolbar_container" type="sight::module::ui::view">
+                <gui>
+                    <toolbar align="top" />
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="vertical" />
+                    </layout>
+                </gui>
+                <registry>
+                    <toolbar sid="parameter_toolbar_view" />
+                </registry>
+            </service>
+
+            <!-- Page selector, like Sight Viewer -->
+            <service uid="parameter_toolbar_view" type="sight::module::ui::toolbar">
+                <gui>
+                    <layout>
+                        <menu_item name="Camera and tracking" icon="sight::module::ui::icons/tracking.svg" style="check" />
+                        <menu_item name="Data" icon="sight::module::ui::icons/image_series.svg" style="check" />
+                        <menu_item name="Rendering" icon="sight::module::ui::icons/volume.svg" style="check" />
+                        <menu_item name="Placement" icon="sight::module::ui::icons/orientation.svg" style="check" />
+                        <spacer />
+                        <menu_item name="Close parameters" icon="sight::module::ui::icons/left.svg" />
+                    </layout>
+                </gui>
+                <registry>
+                    <menu_item sid="tracking_page_act" />
+                    <menu_item sid="data_page_act" />
+                    <menu_item sid="rendering_page_act" />
+                    <menu_item sid="placement_page_act" />
+                    <menu_item sid="hide_parameter_act" />
+                </registry>
+            </service>
+
+            <!-- ======== Page 1: camera and tracking ======== -->
+
+            <service uid="tracking_page_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::toolbox">
+                        <orientation value="vertical" />
+                        <view caption="Camera" expanded="true" />
+                        <view caption="Tracking" expanded="true" />
+                        <view caption="Pose smoothing and error" expanded="false" />
+                        <view caption="ArUco detector" expanded="false" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="camera_tools_container" />
+                    <view sid="tracking_parameters_srv" />
+                    <view sid="smoothing_view" />
+                    <view sid="aruco_parameters_srv" />
+                </registry>
+            </service>
+
+            <service uid="camera_tools_container" type="sight::module::ui::view">
+                <gui>
+                    <toolbar />
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="vertical" />
+                    </layout>
+                </gui>
+                <registry>
+                    <toolbar sid="camera_tools_toolbar" />
+                </registry>
+            </service>
+
+            <service uid="camera_tools_toolbar" type="sight::module::ui::toolbar">
+                <gui>
+                    <layout>
+                        <menu_item name="Load camera calibration" icon="sight::module::ui::icons/calibration.svg" />
                         <editor />
                         <separator />
                         <menu_item name="Start" icon="sight::module::ui::icons/play.svg" shortcut="Space" />
                         <menu_item name="Pause" icon="sight::module::ui::icons/pause.svg" shortcut="Space" />
-                        <menu_item name="Play" icon="sight::module::ui::icons/play.svg" shortcut="Space" />
+                        <menu_item name="Resume" icon="sight::module::ui::icons/play.svg" shortcut="Space" />
                         <menu_item name="Stop" icon="sight::module::ui::icons/stop.svg" />
                         <menu_item name="Loop" icon="sight::module::ui::icons/loop.svg" style="check" />
-                        <separator />
-                        <menu_item name="Load DICOM folder" icon="sight::module::ui::icons/load.svg" shortcut="Ctrl+D" />
-                        <menu_item name="Load VTK/ITK file" icon="sight::module::ui::icons/image_series.svg" shortcut="Ctrl+O" />
-                        <separator />
-                        <menu_item name="Show volume rendering" icon="sight::module::ui::icons/show_volume.svg" style="check" />
-                        <menu_item name="Show CT slices" icon="sight::module::ui::icons/show_negato.svg" style="check" />
-                        <menu_item name="Show meshes" icon="sight::module::ui::icons/show_mesh.svg" style="check" />
-                        <separator />
-                        <menu_item name="Enable video image undistortion" icon="sight::module::ui::icons/barrel_distortion.svg" style="check" />
-                        <menu_item name="Enable 3D rendering distortion" icon="sight::module::ui::icons/pincushion_distortion.svg" style="check" />
-                        <separator />
-                        <menu_item name="Settings" icon="sight::module::ui::icons/gear.svg" style="check" />
                     </layout>
                 </gui>
                 <registry>
@@ -207,103 +415,15 @@
                     <menu_item sid="resume_video_act" />
                     <menu_item sid="stop_video_act" />
                     <menu_item sid="loop_video_act" />
-                    <menu_item sid="load_dicom_act" />
-                    <menu_item sid="load_file_act" />
-                    <menu_item sid="show_volume_act" />
-                    <menu_item sid="show_negato_act" />
-                    <menu_item sid="show_mesh_act" />
-                    <menu_item sid="start_undistort_act" />
-                    <menu_item sid="start_distort_act" />
-                    <menu_item sid="show_parameters_act" />
                 </registry>
             </service>
 
-            <service uid="camera_view" type="sight::module::ui::view">
-                <gui>
-                    <layout type="sight::ui::layout::line">
-                        <orientation value="horizontal" />
-                        <view proportion="1" />
-                        <view proportion="0" background_color="#36393E" min_width="450" />
-                    </layout>
-                </gui>
-                <registry>
-                    <view sid="video_view" />
-                    <view sid="parameters_view" />
-                </registry>
-            </service>
-
-            <service uid="video_view" type="sight::module::ui::view">
-                <gui>
-                    <layout type="sight::ui::layout::line">
-                        <orientation value="vertical" />
-                        <view proportion="3" />
-                        <view proportion="0" background_color="#36393E" />
-                        <view proportion="0" />
-                    </layout>
-                </gui>
-                <registry>
-                    <view sid="generic_scene_srv" />
-                    <view sid="error_label_view" />
-                    <view sid="progress_bar_srv" />
-                </registry>
-            </service>
-
-            <service uid="error_label_view" type="sight::module::ui::view">
-                <gui>
-                    <layout type="sight::ui::layout::line">
-                        <orientation value="horizontal" />
-                        <view proportion="0" background_color="#36393E" />
-                        <spacer />
-                    </layout>
-                </gui>
-                <registry>
-                    <view sid="error_label_srv" />
-                </registry>
-            </service>
-
-            <service uid="parameters_view" type="sight::module::ui::view">
-                <gui>
-                    <layout type="sight::ui::layout::toolbox">
-                        <orientation value="vertical" />
-                        <view caption="CT placement" expanded="true" />
-                        <view caption="Transfer function" expanded="true" />
-                        <view caption="Volume rendering" expanded="false" />
-                        <view caption="Tracking" expanded="false" />
-                        <view caption="ArUco" expanded="false" />
-                        <spacer />
-                    </layout>
-                </gui>
-                <registry>
-                    <view sid="placement_view" />
-                    <view sid="tf_editor_srv" />
-                    <view sid="volume_parameters_srv" />
-                    <view sid="tracking_view" />
-                    <view sid="aruco_parameters_srv" />
-                </registry>
-            </service>
-
-            <service uid="placement_view" type="sight::module::ui::view">
+            <service uid="smoothing_view" type="sight::module::ui::view">
                 <gui>
                     <layout type="sight::ui::layout::line">
                         <orientation value="vertical" />
                         <view proportion="0" />
                         <view proportion="0" />
-                        <spacer />
-                    </layout>
-                </gui>
-                <registry>
-                    <view sid="ct_parameters_srv" />
-                    <view sid="ct_offset_editor_srv" />
-                </registry>
-            </service>
-
-            <service uid="tracking_view" type="sight::module::ui::view">
-                <gui>
-                    <layout type="sight::ui::layout::line">
-                        <orientation value="vertical" />
-                        <view proportion="0" />
-                        <view proportion="0" />
-                        <spacer />
                     </layout>
                 </gui>
                 <registry>
@@ -312,70 +432,150 @@
                 </registry>
             </service>
 
-            <service uid="progress_bar_srv" type="sight::module::ui::qt::progress_bar" />
+            <!-- ======== Page 2: data ======== -->
 
-            <!-- ************************************* Action ************************************ -->
-
-            <service uid="show_parameters_act" type="sight::module::ui::action">
-                <state checked="true" />
+            <service uid="data_page_view" type="sight::module::ui::view">
+                <gui>
+                    <toolbar />
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="vertical" />
+                        <view proportion="1" />
+                    </layout>
+                </gui>
+                <registry>
+                    <toolbar sid="data_tools_toolbar" />
+                    <view sid="image_manager_widget_srv" />
+                </registry>
             </service>
 
-            <service uid="load_calib_act" type="sight::module::ui::action" />
-            <service uid="load_dicom_act" type="sight::module::ui::action" />
-            <service uid="load_file_act" type="sight::module::ui::action" />
-
-            <!-- Start the frame grabber -->
-            <service uid="start_video_act" type="sight::module::ui::action">
-                <state enabled="false" />
+            <service uid="data_tools_toolbar" type="sight::module::ui::toolbar">
+                <gui>
+                    <layout>
+                        <menu_item name="Load DICOM folder" icon="sight::module::ui::icons/load.svg" shortcut="Ctrl+D" />
+                        <menu_item name="Load VTK/ITK file" icon="sight::module::ui::icons/file.svg" shortcut="Ctrl+O" />
+                    </layout>
+                </gui>
+                <registry>
+                    <menu_item sid="load_dicom_act" />
+                    <menu_item sid="load_file_act" />
+                </registry>
             </service>
 
-            <!-- Pause the frame grabber -->
-            <service uid="pause_video_act" type="sight::module::ui::action">
-                <state visible="false" />
+            <!-- ======== Page 3: rendering ======== -->
+
+            <service uid="rendering_page_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::toolbox">
+                        <orientation value="vertical" />
+                        <view caption="Transfer function" expanded="true" />
+                        <view caption="Volume rendering" expanded="false" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="tf_editor_srv" />
+                    <view sid="volume_parameters_srv" />
+                </registry>
             </service>
 
-            <!-- Resume the frame grabber -->
-            <service uid="resume_video_act" type="sight::module::ui::action">
-                <state visible="false" />
+            <!-- ======== Page 4: placement ======== -->
+
+            <service uid="placement_page_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::toolbox">
+                        <orientation value="vertical" />
+                        <view caption="Scale and anchoring" expanded="true" />
+                        <view caption="Fine tuning (mm / degrees, around the nose tip or the tag center)" expanded="true" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="ct_parameters_srv" />
+                    <view sid="ct_offset_editor_srv" />
+                </registry>
             </service>
 
-            <!-- Stop the frame grabber -->
-            <service uid="stop_video_act" type="sight::module::ui::action">
-                <state enabled="false" />
+            <!-- ******************************* Scene and overlays *********************************** -->
+
+            <service uid="scene_overlay_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::overlay">
+                        <view />
+                        <view x="0" y="0" />
+                        <view x="-1" y="0" />
+                        <view x="25%" y="5%" height="50" width="50%" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="generic_scene_srv" />
+                    <view sid="scene_toolbar_left_view" />
+                    <view sid="status_view" />
+                    <view sid="progress_bar_srv" />
+                </registry>
             </service>
 
-            <!-- Loop the frame grabber -->
-            <service uid="loop_video_act" type="sight::module::ui::action">
-                <state enabled="false" />
+            <!-- Visibility toggles, floating over the scene -->
+            <service uid="scene_toolbar_left_view" type="sight::module::ui::view">
+                <gui>
+                    <toolbar background_color="#00000000" />
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="horizontal" />
+                    </layout>
+                </gui>
+                <registry>
+                    <toolbar sid="scene_toolbar_left" />
+                </registry>
             </service>
 
-            <service uid="start_undistort_act" type="sight::module::ui::action" />
-            <service uid="start_distort_act" type="sight::module::ui::action" />
-
-            <service uid="show_volume_act" type="sight::module::ui::action">
-                <state checked="true" />
+            <service uid="scene_toolbar_left" type="sight::module::ui::toolbar">
+                <gui>
+                    <layout>
+                        <menu_item name="Volume rendering" icon="sight::module::ui::icons/show_volume.svg" style="check" />
+                        <menu_item name="CT slices" icon="sight::module::ui::icons/show_negato.svg" style="check" />
+                        <menu_item name="Meshes" icon="sight::module::ui::icons/show_mesh.svg" style="check" />
+                        <menu_item name="Anchor axes" icon="sight::module::ui::icons/axis.svg" style="check" />
+                        <separator />
+                        <menu_item name="Undistort the video" icon="sight::module::ui::icons/barrel_distortion.svg" style="check" />
+                        <menu_item name="Distort the 3D rendering" icon="sight::module::ui::icons/pincushion_distortion.svg" style="check" />
+                        <separator />
+                        <menu_item name="Fullscreen" icon="sight::module::ui::icons/maximize.svg" />
+                        <menu_item name="Windowed" icon="sight::module::ui::icons/restore.svg" />
+                    </layout>
+                </gui>
+                <registry>
+                    <menu_item sid="show_volume_act" />
+                    <menu_item sid="show_negato_act" />
+                    <menu_item sid="show_mesh_act" />
+                    <menu_item sid="show_axis_act" />
+                    <menu_item sid="start_undistort_act" />
+                    <menu_item sid="start_distort_act" />
+                    <menu_item sid="fullscreen_act" />
+                    <menu_item sid="windowed_act" />
+                </registry>
             </service>
 
-            <service uid="show_negato_act" type="sight::module::ui::action">
-                <state checked="false" />
+            <!-- Tracking status: one indicator per tracker and the reprojection error -->
+            <service uid="status_view" type="sight::module::ui::view">
+                <gui>
+                    <layout type="sight::ui::layout::line">
+                        <orientation value="horizontal" />
+                        <view proportion="0" background_color="#2E3034" />
+                        <view proportion="0" background_color="#2E3034" />
+                        <view proportion="0" background_color="#2E3034" />
+                    </layout>
+                </gui>
+                <registry>
+                    <view sid="face_status_srv" />
+                    <view sid="tag_status_srv" />
+                    <view sid="error_label_srv" />
+                </registry>
             </service>
-
-            <service uid="show_mesh_act" type="sight::module::ui::action">
-                <state checked="true" />
-            </service>
-
-            <!-- hide axis adaptor until a marker is found -->
-            <service uid="hide_axis_srv" type="sight::module::ui::action" />
 
             <!-- ******************************* Begin Generic scene ******************************* -->
 
-            <!-- Scene in which the video and the 3D will be rendered -->
-            <!-- The camera moves according to the tag pose, the tag (and the CT attached to it) is fixed at the origin -->
+            <!-- The camera moves according to the anchor pose, the anchor (and the CT attached to it) is at the origin -->
             <service uid="generic_scene_srv" type="sight::viz::scene3d::render">
-                <!-- It is essential to use the 'manual' mode when doing AR -->
-                <!-- In this mode, the renderer waits for the update sequence to trigger the rendering -->
+                <!-- 'manual' mode: the update sequence triggers the rendering, synchronized with the video -->
                 <scene render_mode="manual">
-                    <background color="#36393E" />
+                    <background color="#2E3034" />
 
                     <layer id="video" compositors="Remap">
                         <adaptor uid="video_adp" />
@@ -384,11 +584,12 @@
 
                     <layer id="overlay">
                         <adaptor uid="debug_video_adp" />
+                        <adaptor uid="face_debug_video_adp" />
                     </layer>
 
                     <layer id="default" compositors="Remap" transparency="Default">
-                        <adaptor uid="axis_adp" />
                         <adaptor uid="camera_adp" />
+                        <adaptor uid="axis_adp" />
                         <adaptor uid="ct_transform_adp" />
                         <adaptor uid="ct_volume_adp" />
                         <adaptor uid="ct_negato_adp" />
@@ -406,24 +607,28 @@
                 <data image="${debug_frame}" />
             </service>
 
+            <service uid="face_debug_video_adp" type="sight::module::viz::scene3d::adaptor::video">
+                <data image="${face_debug_frame}" />
+            </service>
+
             <service uid="undistort_adp" type="sight::module::viz::scene3d::adaptor::compositor_parameter">
                 <data parameter="${undistort_map}" />
                 <config compositor_name="Remap" parameter="u_map" shader_type="fragment" visible="false" />
             </service>
 
-            <service uid="axis_adp" type="sight::module::viz::scene3d::adaptor::axis">
-                <config length="30" origin="true" label="false" />
-            </service>
-
             <!-- Camera for the 3D layer, driven by the tracking -->
             <service uid="camera_adp" type="sight::module::viz::scene3d::adaptor::camera">
-                <data transform_in="${camera_to_marker_damped}" />
+                <data transform_in="${camera_to_anchor_damped}" />
                 <data calibration="${camera}" />
             </service>
 
-            <!-- Transform node holding the medical data, expressed in the tag frame -->
+            <service uid="axis_adp" type="sight::module::viz::scene3d::adaptor::axis">
+                <config length="30" origin="true" label="false" visible="false" />
+            </service>
+
+            <!-- Transform node holding the medical data, expressed in the anchor frame -->
             <service uid="ct_transform_adp" type="sight::module::viz::scene3d::adaptor::transform">
-                <data transform="${ct_to_marker}" />
+                <data transform="${ct_to_anchor}" />
                 <config transform="ct_transform" />
             </service>
 
@@ -461,6 +666,106 @@
                 <config compositor_name="Remap" parameter="u_map" shader_type="fragment" visible="false" />
             </service>
 
+            <!-- ************************************* Actions ************************************ -->
+
+            <!-- Parameter pages -->
+            <service uid="tracking_page_act" type="sight::module::ui::modify_layout">
+                <state checked="true" />
+                <config>
+                    <show sid="tracking_page_view" />
+                    <hide sid="data_page_view" />
+                    <hide sid="rendering_page_view" />
+                    <hide sid="placement_page_view" />
+                </config>
+            </service>
+
+            <service uid="data_page_act" type="sight::module::ui::modify_layout">
+                <config>
+                    <hide sid="tracking_page_view" />
+                    <show sid="data_page_view" />
+                    <hide sid="rendering_page_view" />
+                    <hide sid="placement_page_view" />
+                </config>
+            </service>
+
+            <service uid="rendering_page_act" type="sight::module::ui::modify_layout">
+                <config>
+                    <hide sid="tracking_page_view" />
+                    <hide sid="data_page_view" />
+                    <show sid="rendering_page_view" />
+                    <hide sid="placement_page_view" />
+                </config>
+            </service>
+
+            <service uid="placement_page_act" type="sight::module::ui::modify_layout">
+                <config>
+                    <hide sid="tracking_page_view" />
+                    <hide sid="data_page_view" />
+                    <hide sid="rendering_page_view" />
+                    <show sid="placement_page_view" />
+                </config>
+            </service>
+
+            <!-- Show or hide the parameter panel -->
+            <service uid="hide_parameter_act" type="sight::module::ui::action" />
+            <service uid="show_parameter_act" type="sight::module::ui::action" />
+
+            <service uid="load_calib_act" type="sight::module::ui::action" />
+            <service uid="load_dicom_act" type="sight::module::ui::action" />
+            <service uid="load_file_act" type="sight::module::ui::action" />
+
+            <!-- Start the frame grabber -->
+            <service uid="start_video_act" type="sight::module::ui::action">
+                <state enabled="false" />
+            </service>
+
+            <!-- Pause the frame grabber -->
+            <service uid="pause_video_act" type="sight::module::ui::action">
+                <state visible="false" />
+            </service>
+
+            <!-- Resume the frame grabber -->
+            <service uid="resume_video_act" type="sight::module::ui::action">
+                <state visible="false" />
+            </service>
+
+            <!-- Stop the frame grabber -->
+            <service uid="stop_video_act" type="sight::module::ui::action">
+                <state enabled="false" />
+            </service>
+
+            <!-- Loop the frame grabber (video files) -->
+            <service uid="loop_video_act" type="sight::module::ui::action">
+                <state enabled="false" />
+            </service>
+
+            <service uid="show_volume_act" type="sight::module::ui::action">
+                <state checked="true" />
+            </service>
+
+            <service uid="show_negato_act" type="sight::module::ui::action">
+                <state checked="false" />
+            </service>
+
+            <service uid="show_mesh_act" type="sight::module::ui::action">
+                <state checked="true" />
+            </service>
+
+            <service uid="show_axis_act" type="sight::module::ui::action">
+                <state checked="false" />
+            </service>
+
+            <service uid="start_undistort_act" type="sight::module::ui::action" />
+            <service uid="start_distort_act" type="sight::module::ui::action" />
+
+            <service uid="fullscreen_act" type="sight::module::ui::viz::screen_selector">
+                <config mode="select" />
+            </service>
+
+            <service uid="windowed_act" type="sight::module::ui::action">
+                <state visible="false" />
+            </service>
+
             <!-- ************************************* Services ************************************ -->
 
             <!-- ======== Medical data ======== -->
@@ -483,30 +788,38 @@
                 <config id="ct_ar::itk_reader_cfg" service="sight::module::io::itk::series_set_reader" />
             </service>
 
-            <!-- Extracts the first image and the first model of the series set -->
+            <!-- Thumbnail cards of the loaded series, like Sight Viewer -->
+            <service uid="image_manager_widget_srv" type="sight::module::ui::qt::series::image_manager_widget">
+                <in key="series_set" uid="series_set" />
+                <in key="model_series" uid="model_series" />
+                <config thumbnail_width="130" thumbnail_height="96" thumbnail_color="#00000000" />
+            </service>
+
+            <!-- Extracts the active image and model of the series set -->
             <service uid="extract_series_srv" type="sight::module::ui::qt::series::select_dialog">
                 <inout key="series_set" uid="series_set" />
                 <out key="model_series" uid="model_series" />
                 <out key="image" uid="image" />
             </service>
 
-            <!-- Places the loaded data on the tag -->
+            <!-- Places the loaded data on the tag or on the face -->
             <service uid="ct_placement_srv" type="ct_ar::ct_placement">
                 <data series="${series_set}" />
                 <data offset="${ct_offset}" />
-                <data transform="${ct_to_marker}" />
-                <config scale="${ct_params}.scale" sit_on_tag="${ct_params}.sit_on_tag" />
+                <data transform="${ct_to_anchor}" />
+                <config mode="${tracking_params}.mode" scale="${ct_params}.scale" sit_on_tag="${ct_params}.sit_on_tag" skin_threshold="${ct_params}.skin_threshold" />
             </service>
 
             <service uid="ct_parameters_srv" type="sight::module::ui::qt::settings">
-                <item data="${ct_params}.scale" name="Scale (1 = real size)" widget="slider" min="0.05" max="2.0" />
-                <item data="${ct_params}.sit_on_tag" name="Stand on the tag (otherwise centered)" />
+                <item data="${ct_params}.scale" name="Scale (1 = real size)" key="scale" widget="slider" min="0.05" max="2.0" />
+                <item data="${ct_params}.sit_on_tag" name="Tag mode: stand on the tag" key="sit_on_tag" />
+                <item data="${ct_params}.skin_threshold" name="Face mode: skin threshold for the CT nose tip (HU)" key="skin_threshold" min="-900" max="0" widget="slider" emit_on_release="true" />
             </service>
 
-            <!-- Translation (mm) and rotation (degrees) of the CT around the tag -->
+            <!-- Translation (mm) and rotation (degrees) of the CT around the anchor -->
             <service uid="ct_offset_editor_srv" type="sight::module::ui::qt::viz::transform_editor">
                 <inout key="matrix" uid="ct_offset" />
-                <translation enabled="true" min="-500" max="500" />
+                <translation enabled="true" min="-300" max="300" />
                 <rotation enabled="true" min="-180" max="180" />
             </service>
 
@@ -516,16 +829,20 @@
             </service>
 
             <service uid="volume_parameters_srv" type="sight::module::ui::qt::settings">
-                <item data="${volume_params}.sampling" name="Samples" min="128" max="2048" widget="slider" />
-                <item data="${volume_params}.opacity_correction" name="Opacity correction" min="0" max="200" widget="slider" />
-                <item data="${volume_params}.pre_integration" name="Pre-integration" />
-                <item data="${volume_params}.ambient_occlusion" name="Ambient occlusion" />
-                <item data="${volume_params}.color_bleeding" name="Color bleeding" />
-                <item data="${volume_params}.shadows" name="Shadows" />
-                <item data="${volume_params}.widgets" name="Clipping box" />
+                <item data="${volume_params}.sampling" name="Samples" key="sampling" min="128" max="2048" widget="slider" reset="false" />
+                <item data="${volume_params}.opacity_correction" name="Opacity correction" key="opacity_correction" min="0" max="200" widget="slider" reset="false" />
+                <item data="${volume_params}.pre_integration" name="Pre-integration" key="pre_integration" reset="false" />
+                <item data="${volume_params}.ambient_occlusion" name="Ambient occlusion" key="ambient_occlusion" reset="false" />
+                <item data="${volume_params}.color_bleeding" name="Color bleeding" key="color_bleeding" reset="false" />
+                <item data="${volume_params}.shadows" name="Shadows" key="shadows" reset="false" />
+                <item data="${volume_params}.widgets" name="Clipping box" key="widgets" reset="false" />
             </service>
 
-            <!-- ======== Camera / tracking ======== -->
+            <service uid="progress_bar_srv" type="sight::module::ui::qt::progress_bar">
+                <config show_cancel="false" />
+            </service>
+
+            <!-- ======== Camera / video ======== -->
 
             <!-- Default calibration loaded at startup (approximate 640x480 webcam) -->
             <service uid="default_calibration_reader_srv" type="sight::module::io::vision::open_cv_reader">
@@ -542,49 +859,6 @@
             <service uid="extract_camera_srv" type="sight::module::data::get_camera">
                 <input camera_set="${camera_set}" />
                 <output camera="${camera}" index="0" />
-            </service>
-
-            <!-- GUI to handle aruco tracking parameters -->
-            <service uid="aruco_parameters_srv" type="sight::module::ui::qt::settings">
-                <item data="${aruco_params}.debug_mode" name="Show Marker" />
-                <item data="${aruco_params}.corner_refinement:enabled" name="Corner refinement" />
-                <item data="${aruco_params}.adaptive_threshold:win_size_min" name="adpt. Threshold win size min" widget="slider" min="3" max="100" />
-                <item data="${aruco_params}.adaptive_threshold:win_size_max" name="adpt. Threshold win size max" widget="slider" min="4" max="100" />
-                <item data="${aruco_params}.adaptive_threshold:win_size_step" name="adpt. Threshold win size step" widget="slider" min="1" max="100" />
-                <item data="${aruco_params}.adaptive_threshold:constant" name="adpt. threshold constant" min="0." max="30." />
-                <item data="${aruco_params}.marker_detection:min_perimeter_rate" name="Min. Marker Perimeter Rate" min="0.01" max="1.0" />
-                <item data="${aruco_params}.marker_detection:max_perimeter_rate" name="Max. Marker Perimeter Rate" min="1." max="10." />
-                <item data="${aruco_params}.marker_detection:polygonal_approx_accuracy_rate" name="Polygonal Approx. Accuracy Rate" min="0.01" max="1." />
-                <item data="${aruco_params}.marker_detection:min_corner_distance_rate" name="Min. Corner Distance Rate" min="0." max="1." />
-                <item data="${aruco_params}.marker_detection:min_distance_to_border" name="Min. Distance to Border" widget="slider" min="0" max="10" />
-                <item data="${aruco_params}.marker_detection:min_marker_distance_rate" name="Min. Marker Distance Rate" min="0." max="1." />
-                <item data="${aruco_params}.corner_refinement:win_size" name="Corner Refinement Win. Size" widget="slider" min="1" max="100" />
-                <item data="${aruco_params}.corner_refinement:max_iterations" name="Corner Refinement Max Iterations" widget="slider" min="1" max="10" />
-                <item data="${aruco_params}.corner_refinement:min_accuracy" name="Corner Refinement Min. Accuracy" min="0.01" max="10." />
-                <item data="${aruco_params}.marker:border_bits" name="Marker Border Bits" widget="slider" min="1" max="100" />
-                <item data="${aruco_params}.perspective_removal:pixel_per_cell" name="Perspective Remove Pixel per Cell" widget="slider" min="1" max="32" />
-                <item data="${aruco_params}.perspective_removal:ignored_margin_per_cell" name="Perspective Remove Ignored Margin Per Cell" min="0." max="1." />
-                <item data="${aruco_params}.error_correction:max_erroneous_bits_in_border_rate" name="Max. Erroneous Bits In Border Rate" min="0." max="1." />
-                <item data="${aruco_params}.error_correction:min_otsu_std_dev" name="Min. Otsu Std. Dev." min="0." max="100." />
-                <item data="${aruco_params}.error_correction:rate" name="Error Correction Rate" min="0." max="1." />
-            </service>
-
-            <service uid="reprojection_parameters_srv" type="sight::module::ui::qt::settings">
-                <item data="${reprojection_params}.display" name="Show reprojection" />
-                <item data="${reprojection_params}.color" name="Circle color" />
-            </service>
-
-            <service uid="damping_parameters_srv" type="sight::module::ui::qt::settings">
-                <item data="${damping_params}.enabled" name="Damping" />
-                <item data="${damping_params}.weight" name="Weight" min="0.1" max="1." widget="slider" />
-            </service>
-
-            <!-- Gui Service to display a value in a QLabel -->
-            <service uid="error_label_srv" type="sight::module::ui::qt::text_status">
-                <label>Reprojection error (RMSE):</label>
-                <color>#D25252</color>
-                <size>12pt</size>
-                <decimals>3</decimals>
             </service>
 
             <!-- GUI to select camera (device, file, or stream) -->
@@ -611,6 +885,27 @@
                         <item image="${source_frame}" />
                     </frames>
                 </output>
+            </service>
+
+            <!-- ======== Tracking ======== -->
+
+            <service uid="tracking_parameters_srv" type="sight::module::ui::qt::settings">
+                <item data="${tracking_params}.mode" name="Anchor" key="mode" widget="buttonBar" style="ToolButtonTextBesideIcon" width="24" height="24">
+                    <item value="tag" label="ArUco tag" icon="sight::module::ui::icons/tracking.svg" />
+                    <item value="face" label="Face" icon="sight::module::ui::icons/human.svg" />
+                </item>
+                <item data="${tracking_params}.show_landmarks" name="Show face landmarks" key="show_landmarks" />
+                <item data="${tracking_params}.presence" name="Face presence threshold" key="presence" widget="slider" min="0.1" max="0.95" />
+                <item data="${aruco_params}.debug_mode" name="Show detected tags" key="tag_debug" />
+            </service>
+
+            <!-- Face tracker: YuNet detection + MediaPipe face mesh (OpenCV dnn) + PnP. Runs only in face mode. -->
+            <service uid="face_tracker_srv" type="ct_ar::face_tracker" worker="tracking" auto_connect="false">
+                <data camera="${camera}" />
+                <data frame="${source_frame}" />
+                <data pose="${face_to_camera}" />
+                <data debug_frame="${face_debug_frame}" />
+                <config mode="${tracking_params}.mode" show_landmarks="${tracking_params}.show_landmarks" presence_threshold="${tracking_params}.presence" />
             </service>
 
             <!-- Aruco tracker service (dictionary: DICT_ARUCO_ORIGINAL) -->
@@ -673,7 +968,7 @@
                 <config pattern_width="60" />
             </service>
 
-            <!-- Computes the reprojection error -->
+            <!-- Computes the reprojection error of the tag -->
             <service uid="error_srv" type="sight::module::geometry::vision::reprojection_error" worker="error" auto_connect="false">
                 <input camera="${camera}" marker_map="${marker_map}">
                     <matrix>
@@ -684,10 +979,24 @@
                 <config pattern_width="60" display="${reprojection_params}.display" color="${reprojection_params}.color" />
             </service>
 
-            <!-- Inverts "marker_to_camera" to get the camera pose in the tag frame -->
+            <!-- Selects the tag or the face pose according to the tracking mode -->
+            <service uid="anchor_switch_srv" type="sight::module::geometry::switch_matrices" auto_connect="false">
+                <data input="${marker_to_camera}" />
+                <data input="${face_to_camera}" />
+                <data output="${anchor_to_camera}" />
+                <data index="${tracking_params}.mode" />
+            </service>
+
+            <!-- Inverts the anchor pose to get the camera pose in the anchor frame -->
             <service uid="matrix_reverser_srv" type="sight::module::geometry::concatenate_matrices" auto_connect="false">
-                <data input="${marker_to_camera}" inverse="true" />
-                <data output="${camera_to_marker}" />
+                <data input="${anchor_to_camera}" inverse="true" />
+                <data output="${camera_to_anchor}" />
+            </service>
+
+            <service uid="damp_matrix_srv" type="sight::module::geometry::weighted_mean_matrix" auto_connect="false">
+                <data raw="${camera_to_anchor}" />
+                <data damped="${camera_to_anchor_damped}" />
+                <config enabled="${damping_params}.enabled" weight="${damping_params}.weight" />
             </service>
 
             <service uid="undistort_srv" type="sight::module::geometry::vision::distortion">
@@ -702,19 +1011,72 @@
                 <mode>distort</mode>
             </service>
 
-            <service uid="damp_matrix_srv" type="sight::module::geometry::weighted_mean_matrix" auto_connect="false">
-                <data raw="${camera_to_marker}" />
-                <data damped="${camera_to_marker_damped}" />
-                <config enabled="${damping_params}.enabled" weight="${damping_params}.weight" />
+            <!-- GUI to handle aruco tracking parameters -->
+            <service uid="aruco_parameters_srv" type="sight::module::ui::qt::settings">
+                <item data="${aruco_params}.corner_refinement:enabled" name="Corner refinement" />
+                <item data="${aruco_params}.adaptive_threshold:win_size_min" name="adpt. Threshold win size min" widget="slider" min="3" max="100" />
+                <item data="${aruco_params}.adaptive_threshold:win_size_max" name="adpt. Threshold win size max" widget="slider" min="4" max="100" />
+                <item data="${aruco_params}.adaptive_threshold:win_size_step" name="adpt. Threshold win size step" widget="slider" min="1" max="100" />
+                <item data="${aruco_params}.adaptive_threshold:constant" name="adpt. threshold constant" min="0." max="30." />
+                <item data="${aruco_params}.marker_detection:min_perimeter_rate" name="Min. Marker Perimeter Rate" min="0.01" max="1.0" />
+                <item data="${aruco_params}.marker_detection:max_perimeter_rate" name="Max. Marker Perimeter Rate" min="1." max="10." />
+                <item data="${aruco_params}.marker_detection:polygonal_approx_accuracy_rate" name="Polygonal Approx. Accuracy Rate" min="0.01" max="1." />
+                <item data="${aruco_params}.marker_detection:min_corner_distance_rate" name="Min. Corner Distance Rate" min="0." max="1." />
+                <item data="${aruco_params}.marker_detection:min_distance_to_border" name="Min. Distance to Border" widget="slider" min="0" max="10" />
+                <item data="${aruco_params}.marker_detection:min_marker_distance_rate" name="Min. Marker Distance Rate" min="0." max="1." />
+                <item data="${aruco_params}.corner_refinement:win_size" name="Corner Refinement Win. Size" widget="slider" min="1" max="100" />
+                <item data="${aruco_params}.corner_refinement:max_iterations" name="Corner Refinement Max Iterations" widget="slider" min="1" max="10" />
+                <item data="${aruco_params}.corner_refinement:min_accuracy" name="Corner Refinement Min. Accuracy" min="0.01" max="10." />
+                <item data="${aruco_params}.marker:border_bits" name="Marker Border Bits" widget="slider" min="1" max="100" />
+                <item data="${aruco_params}.perspective_removal:pixel_per_cell" name="Perspective Remove Pixel per Cell" widget="slider" min="1" max="32" />
+                <item data="${aruco_params}.perspective_removal:ignored_margin_per_cell" name="Perspective Remove Ignored Margin Per Cell" min="0." max="1." />
+                <item data="${aruco_params}.error_correction:max_erroneous_bits_in_border_rate" name="Max. Erroneous Bits In Border Rate" min="0." max="1." />
+                <item data="${aruco_params}.error_correction:min_otsu_std_dev" name="Min. Otsu Std. Dev." min="0." max="100." />
+                <item data="${aruco_params}.error_correction:rate" name="Error Correction Rate" min="0." max="1." />
+            </service>
+
+            <service uid="reprojection_parameters_srv" type="sight::module::ui::qt::settings">
+                <item data="${reprojection_params}.display" name="Show tag reprojection" />
+                <item data="${reprojection_params}.color" name="Circle color" />
+            </service>
+
+            <service uid="damping_parameters_srv" type="sight::module::ui::qt::settings">
+                <item data="${damping_params}.enabled" name="Pose smoothing" />
+                <item data="${damping_params}.weight" name="Responsiveness" min="0.1" max="1." widget="slider" />
+            </service>
+
+            <!-- Status indicators -->
+            <service uid="face_status_srv" type="sight::module::ui::qt::status">
+                <name>Face</name>
+            </service>
+
+            <service uid="tag_status_srv" type="sight::module::ui::qt::status">
+                <name>Tag</name>
+            </service>
+
+            <service uid="error_label_srv" type="sight::module::ui::qt::text_status">
+                <label>RMS (px):</label>
+                <color>#7CABCF</color>
+                <size>11pt</size>
+                <decimals>2</decimals>
             </service>
 
             <!-- ******************************* Connections ***************************************** -->
 
+            <!-- Parameter panel -->
             <connect>
-                <signal>show_parameters_act/is_checked</signal>
-                <slot>parameters_view/set_visible</slot>
+                <signal>hide_parameter_act/clicked</signal>
+                <slot>parameter_view/hide</slot>
+                <slot>left_toolbar_slider_view/show</slot>
             </connect>
 
+            <connect>
+                <signal>show_parameter_act/clicked</signal>
+                <slot>parameter_view/show</slot>
+                <slot>left_toolbar_slider_view/hide</slot>
+            </connect>
+
+            <!-- Scene toggles -->
             <connect>
                 <signal>show_volume_act/is_checked</signal>
                 <slot>ct_volume_adp/update_visibility</slot>
@@ -731,8 +1093,55 @@
             </connect>
 
             <connect>
-                <signal>hide_axis_srv/is_checked</signal>
+                <signal>show_axis_act/is_checked</signal>
                 <slot>axis_adp/update_visibility</slot>
+            </connect>
+
+            <connect>
+                <signal>start_undistort_act/checked</signal>
+                <slot>undistort_adp/show</slot>
+                <slot>start_distort_act/disable</slot>
+            </connect>
+
+            <connect>
+                <signal>start_undistort_act/unchecked</signal>
+                <slot>undistort_adp/hide</slot>
+                <slot>start_distort_act/enable</slot>
+            </connect>
+
+            <connect>
+                <signal>start_distort_act/checked</signal>
+                <slot>distort_adp/show</slot>
+                <slot>start_undistort_act/disable</slot>
+            </connect>
+
+            <connect>
+                <signal>start_distort_act/unchecked</signal>
+                <slot>distort_adp/hide</slot>
+                <slot>start_undistort_act/enable</slot>
+            </connect>
+
+            <!-- Fullscreen -->
+            <connect>
+                <signal>fullscreen_act/screen_selected</signal>
+                <slot>generic_scene_srv/enable_fullscreen</slot>
+            </connect>
+
+            <connect>
+                <signal>generic_scene_srv/fullscreen_set</signal>
+                <slot>windowed_act/show</slot>
+                <slot>fullscreen_act/hide</slot>
+            </connect>
+
+            <connect>
+                <signal>windowed_act/clicked</signal>
+                <slot>generic_scene_srv/disable_fullscreen</slot>
+            </connect>
+
+            <connect>
+                <signal>generic_scene_srv/fullscreen_unset</signal>
+                <slot>windowed_act/hide</slot>
+                <slot>fullscreen_act/show</slot>
             </connect>
 
             <!-- Medical data loading -->
@@ -760,14 +1169,67 @@
                 <slot>generic_scene_srv/request_render</slot>
             </connect>
 
-            <!-- Re-render when the placement changes, so that it is visible even when the video is paused -->
             <connect>
-                <signal>ct_to_marker/modified</signal>
+                <signal>image_manager_widget_srv/image_removed</signal>
+                <slot>extract_series_srv/remove_image</slot>
+            </connect>
+
+            <connect>
+                <signal>image_manager_widget_srv/image_selected</signal>
+                <slot>extract_series_srv/select_image</slot>
+            </connect>
+
+            <connect>
+                <signal>image_manager_widget_srv/image_visibility_changed</signal>
+                <slot>ct_volume_adp/set_image_visibility</slot>
+                <slot>ct_negato_adp/set_image_visibility</slot>
+            </connect>
+
+            <connect>
+                <signal>image_manager_widget_srv/model_removed</signal>
+                <slot>extract_series_srv/remove_model</slot>
+            </connect>
+
+            <connect>
+                <signal>image_manager_widget_srv/model_selected</signal>
+                <slot>extract_series_srv/select_model</slot>
+            </connect>
+
+            <!-- Re-render when the placement or the transfer function changes, even when the video is paused -->
+            <connect>
+                <signal>ct_to_anchor/modified</signal>
                 <signal>ct_tf/modified</signal>
                 <slot>generic_scene_srv/request_render</slot>
             </connect>
 
-            <!-- Video -->
+            <!-- Tracking status -->
+            <connect>
+                <signal>tracker_srv/marker_detected</signal>
+                <slot>tag_status_srv/toggle_green_red</slot>
+            </connect>
+
+            <connect>
+                <signal>face_tracker_srv/face_detected</signal>
+                <slot>face_status_srv/toggle_green_red</slot>
+            </connect>
+
+            <connect>
+                <signal>error_srv/error_computed</signal>
+                <signal>face_tracker_srv/error_computed</signal>
+                <slot>error_label_srv/set_double_parameter</slot>
+            </connect>
+
+            <!-- Calibration and video -->
+            <connect>
+                <signal>load_calib_act/clicked</signal>
+                <slot>calibration_reader_srv/update</slot>
+            </connect>
+
+            <connect>
+                <signal>camera_set/modified</signal>
+                <slot>extract_camera_srv/update</slot>
+            </connect>
+
             <connect>
                 <signal>video_selector_srv/configured_file</signal>
                 <signal>video_selector_srv/configured_stream</signal>
@@ -795,33 +1257,13 @@
             </connect>
 
             <connect>
-                <signal>error_srv/error_computed</signal>
-                <slot>error_label_srv/set_double_parameter</slot>
-            </connect>
-
-            <connect>
-                <signal>camera_set/modified</signal>
-                <slot>extract_camera_srv/update</slot>
-            </connect>
-
-            <connect>
-                <signal>tracker_srv/marker_detected</signal>
-                <slot>axis_adp/update_visibility</slot>
-            </connect>
-
-            <connect>
-                <signal>load_calib_act/updated</signal>
-                <slot>calibration_reader_srv/update</slot>
-            </connect>
-
-            <connect>
-                <signal>start_video_act/updated</signal>
+                <signal>start_video_act/clicked</signal>
                 <slot>video_grabber_srv/start_camera</slot>
                 <slot>updater/start</slot>
             </connect>
 
             <connect>
-                <signal>pause_video_act/updated</signal>
+                <signal>pause_video_act/clicked</signal>
                 <slot>updater/stop</slot>
                 <slot>video_grabber_srv/pause_camera</slot>
                 <slot>resume_video_act/show</slot>
@@ -829,7 +1271,7 @@
             </connect>
 
             <connect>
-                <signal>resume_video_act/updated</signal>
+                <signal>resume_video_act/clicked</signal>
                 <slot>video_grabber_srv/pause_camera</slot>
                 <slot>updater/start</slot>
                 <slot>resume_video_act/hide</slot>
@@ -837,7 +1279,7 @@
             </connect>
 
             <connect>
-                <signal>stop_video_act/updated</signal>
+                <signal>stop_video_act/clicked</signal>
                 <slot>video_grabber_srv/stop_camera</slot>
                 <slot>updater/stop</slot>
                 <slot>start_video_act/show</slot>
@@ -849,39 +1291,13 @@
             </connect>
 
             <connect>
-                <signal>loop_video_act/updated</signal>
+                <signal>loop_video_act/clicked</signal>
                 <slot>video_grabber_srv/loop_video</slot>
-            </connect>
-
-            <connect>
-                <signal>start_undistort_act/checked</signal>
-                <slot>undistort_adp/show</slot>
-                <slot>start_distort_act/disable</slot>
-            </connect>
-
-            <connect>
-                <signal>start_undistort_act/unchecked</signal>
-                <slot>undistort_adp/hide</slot>
-                <slot>start_distort_act/enable</slot>
-            </connect>
-
-            <connect>
-                <signal>start_distort_act/checked</signal>
-                <slot>distort_adp/show</slot>
-                <slot>start_undistort_act/disable</slot>
-            </connect>
-
-            <connect>
-                <signal>start_distort_act/unchecked</signal>
-                <slot>distort_adp/hide</slot>
-                <slot>start_undistort_act/enable</slot>
             </connect>
 
             <!-- ******************************* Update services ***************************************** -->
 
             <update>
-                <service uid="show_parameters_act" />
-                <service uid="hide_axis_srv" />
                 <service uid="default_calibration_reader_srv" />
 
                 <sequence uid="updater" loop="true" start="false" worker="tracking">
@@ -889,6 +1305,8 @@
                     <service uid="tracker_srv" />
                     <service uid="registration_srv" />
                     <service uid="error_srv" />
+                    <service uid="face_tracker_srv" />
+                    <service uid="anchor_switch_srv" />
                     <service uid="matrix_reverser_srv" />
                     <service uid="damp_matrix_srv" />
                     <service uid="generic_scene_srv" />

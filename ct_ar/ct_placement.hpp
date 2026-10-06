@@ -1,29 +1,43 @@
 #pragma once
 
 #include <data/boolean.hpp>
+#include <data/integer.hpp>
 #include <data/matrix4.hpp>
 #include <data/real.hpp>
 #include <data/series_set.hpp>
 
 #include <service/filter.hpp>
 
+#include <glm/glm.hpp>
+
+#include <cstdint>
+#include <optional>
+
 namespace ct_ar
 {
 
 /**
- * @brief Computes the transform that places a CT scan (or any loaded image/mesh series) on top of the ArUco tag.
+ * @brief Computes the transform that places a CT scan (or any loaded image/mesh series) on the tracked anchor.
  *
- * The marker frame computed by `sight::module::geometry::vision::pose_from2d` has its origin at the center of the tag,
- * the X/Y axes in the tag plane and Z along the tag normal. A CT scan on the other hand lives in patient (DICOM)
- * coordinates, so its center is usually hundreds of millimeters away from the origin. This service computes:
+ * Two modes, selected by `config.mode`:
  *
- *   transform = lift * offset * scale * translate(-center)
+ * - **Tag (0)**: the anchor is the ArUco tag frame computed by `pose_from2d` (origin at the tag center, x/y in the tag
+ *   plane, z along the tag normal). The data, in LPS patient coordinates, maps directly onto it (left -> x,
+ *   posterior -> y, superior -> z), so a CT stands upright on a tag lying on a table:
  *
- * - `center` is the center of the axis-aligned bounding box of every image series and model series of the set,
- * - `scale` is a uniform scale factor (1.0 means real size, units are millimeters like the tag width),
- * - `offset` is a user-defined rigid transform (typically edited with a transform_editor) applied around the tag,
- * - `lift` translates the result along the tag normal so that the lowest point of the data sits on the tag plane,
- *   when `sit_on_tag` is enabled.
+ *     transform = lift * offset * scale * translate(-center)
+ *
+ *   `center` is the center of the bounding box of every image and model series; `lift` (when `sit_on_tag` is
+ *   enabled) moves the lowest point of the data onto the tag plane.
+ *
+ * - **Face (1)**: the anchor is the face frame computed by `ct_ar::face_tracker` (origin at the nose tip, x towards
+ *   the subject's left, y up, z out of the face). The CT's nose tip is found automatically (most anterior skin point
+ *   at mid-height of the head) and placed on the user's nose tip, with the patient axes aligned on the head axes:
+ *
+ *     transform = offset * scale * lps_to_face * translate(-ct_nose_tip)
+ *
+ * In both modes `offset` is a user rigid transform (typically edited with a transform_editor) applied around the
+ * anchor origin, and `scale` a uniform scale factor (1 = real size, millimeters).
  *
  * @section XML XML configuration
  * @code{.xml}
@@ -31,21 +45,22 @@ namespace ct_ar
         <data series="${...}" />
         <data offset="${...}" />
         <data transform="${...}" />
-        <config scale="1.0" sit_on_tag="true" />
+        <config mode="${...}" scale="1.0" sit_on_tag="true" skin_threshold="-300" />
    </service>
    @endcode
  *
  * @subsection Input Input
  * - \b data.series [sight::data::series_set]: loaded data (DICOM, VTK, ...), auto-connected.
- * - \b data.offset [sight::data::matrix4]: rigid transform applied around the tag origin, auto-connected.
+ * - \b data.offset [sight::data::matrix4]: rigid transform applied around the anchor origin, auto-connected.
  *
  * @subsection In-Out In-Out
- * - \b data.transform [sight::data::matrix4]: data-to-tag transform, to be used by a transform adaptor.
+ * - \b data.transform [sight::data::matrix4]: data-to-anchor transform, to be used by a transform adaptor.
  *
- * @subsection Properties Properties
- * - \b config.scale (double, default=1.0): uniform scale factor applied to the data, auto-connected.
- * - \b config.sit_on_tag (bool, default=true): if true, the data is lifted so that it stands on the tag instead of
- *   being centered on it, auto-connected.
+ * @subsection Properties Properties (all auto-connected)
+ * - \b config.mode (int, default=0): 0 = tag, 1 = face.
+ * - \b config.scale (double, default=1.0): uniform scale factor applied to the data.
+ * - \b config.sit_on_tag (bool, default=true): tag mode only, lifts the data so that it stands on the tag.
+ * - \b config.skin_threshold (double, default=-300): HU threshold separating air from skin, for the nose tip search.
  */
 class ct_placement final : public sight::service::filter
 {
@@ -75,12 +90,24 @@ protected:
 
 private:
 
+    /// Nose tip of the first image series, in LPS mm, cached until the image changes.
+    std::optional<glm::dvec3> nose_tip(const sight::data::series_set& _series);
+
+    const void* m_nose_image {nullptr};
+    std::uint64_t m_nose_timestamp {0};
+    double m_nose_threshold {0.};
+    std::optional<glm::dvec3> m_nose;
+
     sight::data::ptr<sight::data::series_set, sight::data::access::in> m_series {this, "data.series"};
     sight::data::ptr<sight::data::matrix4, sight::data::access::in> m_offset {this, "data.offset"};
     sight::data::ptr<sight::data::matrix4, sight::data::access::inout> m_transform {this, "data.transform"};
 
+    sight::data::ptr<sight::data::integer, sight::data::access::in> m_mode {this, "config.mode", 0};
     sight::data::ptr<sight::data::real, sight::data::access::in> m_scale {this, "config.scale", 1.0};
     sight::data::ptr<sight::data::boolean, sight::data::access::in> m_sit_on_tag {this, "config.sit_on_tag", true};
+    sight::data::ptr<sight::data::real, sight::data::access::in> m_skin_threshold {this, "config.skin_threshold",
+                                                                                   -300.
+    };
 };
 
 } // namespace ct_ar

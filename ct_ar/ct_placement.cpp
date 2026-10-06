@@ -1,5 +1,9 @@
 #include "ct_placement.hpp"
 
+#include "nose_tip.hpp"
+
+#include <core/spy_log.hpp>
+
 #include <data/image_series.hpp>
 #include <data/model_series.hpp>
 
@@ -59,7 +63,7 @@ struct bounds
 
 //------------------------------------------------------------------------------
 
-/// Adds the world-space corners of an image to the bounds, taking origin, spacing and orientation into account.
+/// Adds the world-space corners of an image to the bounds.
 void add_image(bounds& _bounds, const sight::data::image& _image)
 {
     const auto& size = _image.size();
@@ -68,29 +72,19 @@ void add_image(bounds& _bounds, const sight::data::image& _image)
         return;
     }
 
-    const auto& spacing     = _image.spacing();
-    const auto& origin      = _image.origin();
-    const auto& orientation = _image.orientation(); // Row-major 3x3 matrix
-
-    const glm::dvec3 extent {
-        static_cast<double>(size[0]) * spacing[0],
-        static_cast<double>(size[1]) * spacing[1],
-        static_cast<double>(std::max<std::size_t>(size[2], 1)) * spacing[2]
+    const voxel_to_world to_world(_image);
+    // Voxel centers are at integer indices: the image extends half a voxel around them.
+    const bounds local {
+        .min = glm::dvec3(-0.5),
+        .max = glm::dvec3(
+            static_cast<double>(size[0]) - 0.5,
+            static_cast<double>(size[1]) - 0.5,
+            static_cast<double>(std::max<std::size_t>(size[2], 1)) - 0.5
+        )
     };
-
-    const bounds local {.min = glm::dvec3(0.), .max = extent};
     for(const auto& corner : local.corners())
     {
-        glm::dvec3 world {origin[0], origin[1], origin[2]};
-        for(glm::length_t row = 0 ; row < 3 ; ++row)
-        {
-            for(glm::length_t col = 0 ; col < 3 ; ++col)
-            {
-                world[row] += orientation[static_cast<std::size_t>(row * 3 + col)] * corner[col];
-            }
-        }
-
-        _bounds.expand(world);
+        _bounds.expand(to_world(corner));
     }
 }
 
@@ -117,6 +111,66 @@ void add_model(bounds& _bounds, const sight::data::model_series& _model)
         _bounds.expand({box.max[0], box.max[1], box.max[2]});
     }
 }
+
+//------------------------------------------------------------------------------
+
+std::optional<glm::dvec3> nose_tip_of(const sight::data::image& _image, double _threshold)
+{
+    const auto& size = _image.size();
+    if(size[0] < 2 || size[1] < 2 || size[2] < 2 || _image.num_components() != 1)
+    {
+        return std::nullopt;
+    }
+
+    const auto lock   = _image.dump_lock();
+    const void* data  = _image.buffer();
+    const auto type   = _image.type();
+    using sight::core::type;
+    if(type == type::INT16)
+    {
+        return find_nose_tip(_image, static_cast<const std::int16_t*>(data), _threshold);
+    }
+
+    if(type == type::UINT16)
+    {
+        return find_nose_tip(_image, static_cast<const std::uint16_t*>(data), _threshold);
+    }
+
+    if(type == type::INT32)
+    {
+        return find_nose_tip(_image, static_cast<const std::int32_t*>(data), _threshold);
+    }
+
+    if(type == type::FLOAT32)
+    {
+        return find_nose_tip(_image, static_cast<const float*>(data), _threshold);
+    }
+
+    if(type == type::FLOAT64)
+    {
+        return find_nose_tip(_image, static_cast<const double*>(data), _threshold);
+    }
+
+    if(type == type::INT8)
+    {
+        return find_nose_tip(_image, static_cast<const std::int8_t*>(data), _threshold);
+    }
+
+    if(type == type::UINT8)
+    {
+        return find_nose_tip(_image, static_cast<const std::uint8_t*>(data), _threshold);
+    }
+
+    return std::nullopt;
+}
+
+/// LPS -> face frame: x = left, y = superior, z = anterior (-posterior).
+const glm::dmat4 LPS_TO_FACE = glm::dmat4(
+    glm::dvec4(1., 0., 0., 0.),  // column 0: L -> x
+    glm::dvec4(0., 0., -1., 0.), // column 1: P -> -z
+    glm::dvec4(0., 1., 0., 0.),  // column 2: S -> y
+    glm::dvec4(0., 0., 0., 1.)
+);
 
 } // namespace
 
@@ -149,9 +203,52 @@ sight::service::connections_t ct_placement::auto_connections() const
         {m_series, sight::data::series_set::signals::ADDED_OBJECTS, sight::service::slots::UPDATE},
         {m_series, sight::data::series_set::signals::REMOVED_OBJECTS, sight::service::slots::UPDATE},
         {m_offset, sight::data::signals::MODIFIED, sight::service::slots::UPDATE},
+        {m_mode, sight::data::signals::MODIFIED, sight::service::slots::UPDATE},
         {m_scale, sight::data::signals::MODIFIED, sight::service::slots::UPDATE},
-        {m_sit_on_tag, sight::data::signals::MODIFIED, sight::service::slots::UPDATE}
+        {m_sit_on_tag, sight::data::signals::MODIFIED, sight::service::slots::UPDATE},
+        {m_skin_threshold, sight::data::signals::MODIFIED, sight::service::slots::UPDATE}
     };
+}
+
+//-----------------------------------------------------------------------------
+
+std::optional<glm::dvec3> ct_placement::nose_tip(const sight::data::series_set& _series)
+{
+    std::shared_ptr<const sight::data::image_series> image;
+    for(const auto& series : _series)
+    {
+        if(auto candidate = std::dynamic_pointer_cast<const sight::data::image_series>(series); candidate)
+        {
+            image = candidate;
+            break;
+        }
+    }
+
+    if(!image)
+    {
+        m_nose_image = nullptr;
+        m_nose.reset();
+        return std::nullopt;
+    }
+
+    const double threshold = *m_skin_threshold;
+    if(image.get() != m_nose_image || image->last_modified() != m_nose_timestamp || threshold != m_nose_threshold)
+    {
+        m_nose           = nose_tip_of(*image, threshold);
+        m_nose_image     = image.get();
+        m_nose_timestamp = image->last_modified();
+        m_nose_threshold = threshold;
+        if(m_nose)
+        {
+            SIGHT_INFO("CT nose tip (LPS mm): " << m_nose->x << ", " << m_nose->y << ", " << m_nose->z);
+        }
+        else
+        {
+            SIGHT_WARN("Could not find the nose tip in the CT, the CT center is used instead");
+        }
+    }
+
+    return m_nose;
 }
 
 //-----------------------------------------------------------------------------
@@ -159,6 +256,8 @@ sight::service::connections_t ct_placement::auto_connections() const
 void ct_placement::updating()
 {
     bounds data_bounds;
+    std::optional<glm::dvec3> nose;
+    const bool face_mode = *m_mode == 1;
     {
         const auto series_set = m_series.const_lock();
         for(const auto& series : *series_set)
@@ -172,27 +271,40 @@ void ct_placement::updating()
                 add_model(data_bounds, *model);
             }
         }
+
+        if(face_mode)
+        {
+            nose = this->nose_tip(*series_set);
+        }
     }
 
     const glm::dvec3 center = data_bounds.valid() ? (data_bounds.min + data_bounds.max) * 0.5 : glm::dvec3(0.);
-    const double scale      = std::max(m_scale.const_lock()->value(), 1e-6);
-
+    const double scale      = std::max(static_cast<double>(*m_scale), 1e-6);
     const glm::dmat4 offset = sight::geometry::data::to_glm_mat(*m_offset.const_lock());
+    const glm::dmat4 scaling = glm::scale(glm::dmat4(1.), glm::dvec3(scale));
 
-    glm::dmat4 placement = offset
-                           * glm::scale(glm::dmat4(1.), glm::dvec3(scale))
-                           * glm::translate(glm::dmat4(1.), -center);
-
-    if(data_bounds.valid() && m_sit_on_tag.const_lock()->value())
+    glm::dmat4 placement;
+    if(face_mode)
     {
-        // Find the lowest point of the transformed bounding box along the tag normal (Z), and move it onto the tag.
-        double lowest = std::numeric_limits<double>::max();
-        for(const auto& corner : data_bounds.corners())
-        {
-            lowest = std::min(lowest, (placement * glm::dvec4(corner, 1.)).z);
-        }
+        // CT nose tip on the face nose tip (the face frame origin), patient axes on the head axes.
+        const glm::dvec3 anchor = nose.value_or(center);
+        placement = offset * scaling * LPS_TO_FACE * glm::translate(glm::dmat4(1.), -anchor);
+    }
+    else
+    {
+        placement = offset * scaling * glm::translate(glm::dmat4(1.), -center);
 
-        placement = glm::translate(glm::dmat4(1.), glm::dvec3(0., 0., -lowest)) * placement;
+        if(data_bounds.valid() && *m_sit_on_tag)
+        {
+            // Move the lowest point of the transformed bounding box onto the tag plane.
+            double lowest = std::numeric_limits<double>::max();
+            for(const auto& corner : data_bounds.corners())
+            {
+                lowest = std::min(lowest, (placement * glm::dvec4(corner, 1.)).z);
+            }
+
+            placement = glm::translate(glm::dmat4(1.), glm::dvec3(0., 0., -lowest)) * placement;
+        }
     }
 
     {
