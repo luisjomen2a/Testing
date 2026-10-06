@@ -1,0 +1,4 @@
+# Sight checkout and build created by scripts/build_with_sight.sh
+/sight/
+/sight-build/
+__pycache__/

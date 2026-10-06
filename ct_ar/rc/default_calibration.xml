@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<opencv_storage>
+<nbCameras>1</nbCameras>
+<camera_0>
+  <id>webcam</id>
+  <description>"approximate webcam model, hfov=60deg, no distortion"</description>
+  <imageWidth>640</imageWidth>
+  <imageHeight>480</imageHeight>
+  <matrix type_id="opencv-matrix">
+    <rows>3</rows>
+    <cols>3</cols>
+    <dt>d</dt>
+    <data>
+      554.25625842204079 0. 320. 0. 554.25625842204079 240. 0. 0. 1.</data></matrix>
+  <distortion type_id="opencv-matrix">
+    <rows>1</rows>
+    <cols>5</cols>
+    <dt>d</dt>
+    <data>
+      0. 0. 0. 0. 0.</data></distortion>
+  <scale>1.</scale></camera_0>
+</opencv_storage>
